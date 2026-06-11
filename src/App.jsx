@@ -136,6 +136,28 @@ function canUseStand(flight, stand, assignment, currentAssignments) {
   ));
 }
 
+function explainManualMove(flight, stand, assignment, currentAssignments, allFlights) {
+  const reasons = compatibilityReasons(flight, stand);
+  currentAssignments
+    .filter((item) => item.flightId !== flight.id && item.standId === stand.id && overlaps(assignment.occupyStart, assignment.occupyEnd, item.occupyStart, item.occupyEnd, safeGapMinutes))
+    .forEach((item) => {
+      const other = allFlights.find((target) => target.id === item.flightId);
+      reasons.push(`${stand.id} 在 ${timeLabel(Math.max(assignment.occupyStart, item.occupyStart))}-${timeLabel(Math.min(assignment.occupyEnd, item.occupyEnd))} 已被 ${other?.flightNo || item.flightId} 占用`);
+    });
+  if (wideAircraft.includes(flight.aircraftType)) {
+    stand.adjacentRestrictions.forEach((adjacentId) => {
+      currentAssignments
+        .filter((item) => item.flightId !== flight.id && item.standId === adjacentId && overlaps(assignment.occupyStart, assignment.occupyEnd, item.occupyStart, item.occupyEnd, safeGapMinutes))
+        .forEach((item) => {
+          const other = allFlights.find((target) => target.id === item.flightId);
+          reasons.push(`${flight.aircraftType} 占用 ${stand.id} 时要求相邻 ${adjacentId} 隔离，但 ${other?.flightNo || item.flightId} 正在占用`);
+        });
+    });
+  }
+  if (!stand.available) reasons.push(`${stand.id} 当前不可用`);
+  return reasons;
+}
+
 function scoreStand(flight, stand, assignments) {
   const load = assignments.filter((assignment) => assignment.standId === stand.id).length;
   let score = load * 6;
@@ -224,7 +246,7 @@ function optimizeAssignments(flights, previousAssignments, options = {}) {
     }
 
     if (selected) {
-      assignments.push(selected);
+      assignments.push({ ...selected, source: 'system' });
     } else {
       unresolved.push(flight.id);
       assignments.push({
@@ -237,6 +259,7 @@ function optimizeAssignments(flights, previousAssignments, options = {}) {
         locked: flight.locked,
         status: 'unresolved',
         note: '未找到满足机型、时间窗、近远机位和拖曳约束的方案。',
+        source: 'system',
       });
     }
   });
@@ -249,15 +272,24 @@ function generateTowTasks(flights, assignments, towTractors) {
     .filter((assignment) => assignment.mode === 'towSplit' || (assignment.standId && standsData.find((stand) => stand.id === assignment.standId)?.type === 'remote'))
     .map((assignment) => {
       const flight = flights.find((item) => item.id === assignment.flightId);
+      const stand = standsData.find((item) => item.id === assignment.standId);
       const remoteStand = assignment.remoteStandId || assignment.standId;
-      const start = assignment.mode === 'towSplit' ? assignment.occupyEnd + 5 : flight.departure + 8;
+      const isSplitTow = assignment.mode === 'towSplit';
+      const isLongRemoteStay = stand?.type === 'remote' && flight.departure - flight.arrival >= 95;
+      const start = isSplitTow ? assignment.occupyEnd + 5 : flight.arrival + 18;
+      const type = isSplitTow ? '近机位短停后拖至远机位' : '远机位长期停放';
+      const reason = isSplitTow
+        ? `为释放近机位 ${assignment.standId}，${flight.flightNo} 短停后拖至远机位 ${remoteStand}。`
+        : `${flight.flightNo} 过站时间 ${flight.departure - flight.arrival} 分钟，高峰时段靠桥资源紧张，安排远机位长期停放。`;
       return {
         id: `T-${assignment.flightId}`,
         flightId: assignment.flightId,
+        type,
         from: assignment.standId,
-        to: assignment.mode === 'towSplit' ? remoteStand : `维修坪-${remoteStand}`,
+        to: isSplitTow ? remoteStand : `远机位等待区-${remoteStand}`,
         start,
-        end: start + 30,
+        end: start + (isSplitTow ? 28 : 24),
+        reason: isLongRemoteStay || isSplitTow ? reason : '保障等级调整，生成拖曳调整任务。',
       };
     });
   return assignTowTractors(tasks, towTractors);
@@ -400,7 +432,7 @@ function decorateFlights(flights, assignments, issues) {
       hasConflict,
       hasRisk,
       issues: flightIssues,
-      status: hasConflict ? '硬冲突' : hasRisk ? '运行风险' : assignment?.mode === 'towSplit' ? '拖曳方案' : assignment?.standId ? '已分配' : '待优化',
+      status: hasConflict ? '硬冲突' : hasRisk ? '运行风险' : assignment?.source === 'manual-adjust' ? '人工调整' : flight.locked ? '锁定机位' : flight.manualStandId ? '人工指定' : assignment?.mode === 'towSplit' ? '拖曳方案' : assignment?.standId ? '系统分配' : '待优化',
     };
   });
 }
@@ -410,11 +442,15 @@ function calculateMetrics(flights, assignments, towTasks, issues) {
   const occupiedMinutes = assigned.reduce((sum, item) => sum + Math.max(item.occupyEnd - item.occupyStart, 0), 0);
   const totalMinutes = standsData.filter((stand) => stand.available).length * timelineTotalMinutes;
   const nearAssigned = assigned.filter((item) => standsData.find((stand) => stand.id === item.standId)?.type === 'near').length;
+  const remoteFlights = assigned.filter((item) => standsData.find((stand) => stand.id === item.standId)?.type === 'remote').length;
+  const activeTractors = new Set(towTasks.filter((task) => task.tractorId).map((task) => task.tractorId)).size;
   return {
     utilization: totalMinutes ? Math.round((occupiedMinutes / totalMinutes) * 100) : 0,
     conflicts: issues.filter((issue) => issue.category === 'conflict').length,
     unresolved: new Set(issues.filter((issue) => issue.category === 'conflict').map((issue) => issue.flightId)).size,
     towTasks: towTasks.length,
+    remoteFlights,
+    towUtilization: towTractorsData.length ? Math.round((activeTractors / towTractorsData.length) * 100) : 0,
     bridgeRate: assigned.length ? Math.round((nearAssigned / assigned.length) * 100) : 0,
     avgTurn: Math.round(flights.reduce((sum, flight) => sum + flight.departure - flight.arrival, 0) / flights.length),
   };
@@ -472,6 +508,7 @@ function FlightList({ flightRefs, flights, selectedFlightId, onEditFlight, onOpe
               <span>离港 {timeLabel(flight.departure)}</span>
               <span>机位 {flight.standId || '待分配'}{flight.locked ? ' · 锁定' : ''}</span>
             </div>
+            <div className="state-line">{flight.status}</div>
             {flight.issues[0] && <div className="risk-tip">{flight.issues[0].type}：{flight.issues[0].message}</div>}
             <div className="flight-progress"><span style={{ width: `${64 + (flight.flightNo.charCodeAt(2) % 24)}%` }} /></div>
           </article>
@@ -500,7 +537,7 @@ function Timeline({ blockRefs, flights, assignments, selectedFlightId, standRefs
           return (
             <section className="stand-row" key={stand.id}>
               <button className="stand-label stand-button" type="button" onClick={() => onOpenStand(stand.id)}>
-                <strong>{stand.id}</strong><span>{stand.type === 'near' ? '近机位' : '远机位'} · {stand.pier}</span>
+                <strong>{stand.id}</strong><span>{stand.type === 'near' ? '近机位 · 靠桥' : '远机位 · 需摆渡 · 不可靠桥'} · {stand.pier}</span>
               </button>
               <div
                 className={`lane ${activeDropStand === stand.id ? 'drop-target' : ''}`}
@@ -527,12 +564,20 @@ function Timeline({ blockRefs, flights, assignments, selectedFlightId, standRefs
                     >
                       <b>{flight.flightNo}</b>
                       <span>{timeLabel(assignment.occupyStart)}-{timeLabel(assignment.occupyEnd)}</span>
+                      <small>{flight.status}</small>
                       {(flight.hasConflict || flight.hasRisk) && <em>{flight.hasConflict ? '冲突' : '风险'}</em>}
                     </div>
                   );
                 })}
                 {towTasks.filter((task) => task.from === stand.id).map((task) => (
-                  <div className="tow-block" key={task.id} style={getTowPosition(task)}>{task.tractorId || '待派'}</div>
+                  <div
+                    className="tow-block"
+                    key={task.id}
+                    style={getTowPosition(task)}
+                    title={`${task.type}：${timeLabel(task.start)}-${timeLabel(task.end)}，拖车 ${task.tractorId || '待派遣'}。${task.reason}`}
+                  >
+                    {task.from} → {task.to.replace('远机位等待区-', '')}
+                  </div>
                 ))}
               </div>
             </section>
@@ -600,7 +645,7 @@ function FlightForm({ form, title, eyebrow, submitText, onChange, onClose, onSub
   );
 }
 
-function FlightDetailModal({ assignment, flight, stand, towTask, onClose }) {
+function FlightDetailModal({ assignment, flight, onRestoreSystem, stand, towTask, onClose }) {
   const spec = aircraftCatalog[flight.aircraftType];
   return (
     <div className="modal-backdrop" role="presentation">
@@ -620,6 +665,8 @@ function FlightDetailModal({ assignment, flight, stand, towTask, onClose }) {
           </div></article>
           <article className={`detail-card ${flight.issues.some((issue) => issue.highlight === 'manual') ? 'highlight-card' : ''}`}><h3>机位与运行约束</h3><div className="detail-grid">
             <span>当前机位</span><strong>{assignment?.standId || '待分配'}</strong>
+            <span>分配状态</span><strong>{flight.status}</strong>
+            <span>分配来源</span><strong>{assignment?.source === 'manual-adjust' ? '人工调整' : flight.locked ? '锁定机位' : flight.manualStandId ? '人工指定' : '系统分配'}</strong>
             <span>人工指定机位</span><strong>{flight.manualStandId || '无'}</strong>
             <span>锁定机位</span><strong>{flight.locked ? '是' : '否'}</strong>
             <span>允许近机位</span><strong>是</strong>
@@ -638,14 +685,21 @@ function FlightDetailModal({ assignment, flight, stand, towTask, onClose }) {
           </div></article>
           <article className="detail-card"><h3>拖曳相关参数</h3><div className="detail-grid">
             <span>生成拖曳任务</span><strong>{towTask ? '是' : '否'}</strong>
+            <span>拖曳类型</span><strong>{towTask?.type || '-'}</strong>
             <span>起始机位</span><strong>{towTask?.from || '-'}</strong>
             <span>目标机位</span><strong>{towTask?.to || '-'}</strong>
             <span>拖曳开始</span><strong>{towTask ? timeLabel(towTask.start) : '-'}</strong>
             <span>拖曳结束</span><strong>{towTask ? timeLabel(towTask.end) : '-'}</strong>
             <span>拖车编号</span><strong>{towTask?.tractorId || '-'}</strong>
             <span>估计拖曳时间</span><strong>{towTask ? `${towTask.end - towTask.start} 分钟` : '-'}</strong>
+            <span>拖曳原因</span><strong>{towTask?.reason || '-'}</strong>
           </div></article>
         </div>
+        {assignment?.source === 'manual-adjust' && assignment.systemSnapshot && (
+          <div className="modal-actions restore-actions">
+            <button className="primary-button" type="button" onClick={() => onRestoreSystem(flight.id)}>恢复系统分配</button>
+          </div>
+        )}
         <div className="conflict-detail-list diagnosis-list">
           <h3>冲突诊断与建议</h3>
           {flight.issues.length ? flight.issues.map((issue, index) => (
@@ -691,6 +745,7 @@ function StandDetailModal({ assignments, flights, issues, onClose, stand, towTas
             <span>所属区域</span><strong>{stand.terminal} · 指廊 {stand.pier}</strong>
             <span>是否可用</span><strong>{stand.available ? '可用' : '停用'}</strong>
             <span>靠桥机位</span><strong>{stand.bridge ? '是' : '否'}</strong>
+            <span>摆渡需求</span><strong>{stand.bridge ? '无需摆渡' : '需摆渡，不可靠桥'}</strong>
           </div></article>
           <article className={standIssues.some((issue) => issue.highlight === 'compatibility') ? 'detail-card highlight-card' : 'detail-card'}><h3>适配能力</h3><div className="detail-grid">
             <span>支持类别</span><strong>{stand.supportedCategories.join('/')}</strong>
@@ -750,7 +805,11 @@ function TowingDispatchModal({ flights, towTractors, towTasks, onAssignTow, onCl
             const flight = flights.find((item) => item.id === task.flightId);
             return (
               <article className="detail-card tow-assignment" key={task.id}>
-                <div><h3>{flight.flightNo}</h3><p>{task.from} - {task.to} · {timeLabel(task.start)} - {timeLabel(task.end)}</p></div>
+                <div>
+                  <h3>{flight.flightNo}</h3>
+                  <p>{task.type} · {task.from} - {task.to} · {timeLabel(task.start)} - {timeLabel(task.end)} · {task.status}</p>
+                  <p>{task.reason} · 预计 {task.end - task.start} 分钟</p>
+                </div>
                 <select value={task.tractorId} onChange={(event) => onAssignTow(task.id, event.target.value)}>
                   <option value="">待派遣</option>{towTractors.map((tractor) => <option value={tractor.id} key={tractor.id}>{tractor.id}</option>)}
                 </select>
@@ -859,13 +918,14 @@ export default function App() {
 
   function handleAutoReassign() {
     const unlockedAssignments = assignments.filter((assignment) => flights.find((flight) => flight.id === assignment.flightId)?.locked);
+    const manualAdjustedBefore = assignments.filter((assignment) => assignment.source === 'manual-adjust' && !flights.find((flight) => flight.id === assignment.flightId)?.locked).length;
     const result = rerunPlan(flights, unlockedAssignments, { mode: 'global' });
     const adjusted = result.plan.assignments.filter((assignment) => {
       const before = assignments.find((item) => item.flightId === assignment.flightId);
       return before?.standId !== assignment.standId || before?.mode !== assignment.mode;
     }).length;
     const bridgeRate = calculateMetrics(flights, result.plan.assignments, result.tasks, detectConflicts(flights, result.plan.assignments, result.tasks)).bridgeRate;
-    setOperationMessage(`本次自动重排共调整 ${adjusted} 个航班，消除 ${Math.max(result.beforeIssues - result.afterIssues, 0)} 个冲突，新增 ${result.tasks.length} 个拖曳任务，近机位靠桥率提升至 ${bridgeRate}%。${result.plan.unresolved.length ? ` 待解：${result.plan.unresolved.join('、')}` : ''}`);
+    setOperationMessage(`本次自动重排共调整 ${adjusted} 个航班，消除 ${Math.max(result.beforeIssues - result.afterIssues, 0)} 个冲突，新增 ${result.tasks.length} 个拖曳任务，近机位靠桥率提升至 ${bridgeRate}%。本次自动重排覆盖了 ${manualAdjustedBefore} 个人工调整航班。${result.plan.unresolved.length ? ` 待解：${result.plan.unresolved.join('、')}` : ''}`);
   }
 
   function handleResolveConflict(flightId, action) {
@@ -888,6 +948,35 @@ export default function App() {
     setOperationMessage(`${taskId} 已更新拖车派遣。`);
   }
 
+  function handleOpenTowingDispatch() {
+    const nextTasks = assignTowTractors(towTasks.map((task) => ({ ...task, tractorId: '', status: '待执行' })), towTractors);
+    setTowTasks(nextTasks);
+    setIsTowingOpen(true);
+    const pending = nextTasks.filter((task) => task.status === '冲突待解').length;
+    setOperationMessage(
+      nextTasks.length === 0
+        ? '当前未生成拖曳任务：可能没有远机位航班、没有近机位转远机位任务，或当前冲突属于机位时间/相邻机位限制。请先执行自动重排，或手动将适合航班调整至远机位后再生成拖曳任务。'
+        : pending > 0
+        ? `当前拖车资源不足，${pending} 个任务待派遣。`
+        : `拖车派遣已完成，当前生成 ${nextTasks.length} 个拖曳任务。`,
+    );
+  }
+
+  function handleRestoreSystemAssignment(flightId) {
+    const current = assignments.find((assignment) => assignment.flightId === flightId);
+    if (!current?.systemSnapshot) return;
+    const restored = current.systemSnapshot;
+    const nextAssignments = assignments.map((assignment) => (
+      assignment.flightId === flightId
+        ? { ...restored, source: 'system' }
+        : assignment
+    ));
+    const nextTowTasks = generateTowTasks(flights, nextAssignments, towTractors);
+    setAssignments(nextAssignments);
+    setTowTasks(nextTowTasks);
+    setOperationMessage(`${flights.find((flight) => flight.id === flightId)?.flightNo} 已恢复到系统分配方案。`);
+  }
+
   function handleDragStart(event, flight) {
     if (flight.locked) return;
     setDraggingFlightId(flight.id);
@@ -899,13 +988,41 @@ export default function App() {
     event.preventDefault();
     const flightId = event.dataTransfer.getData('text/plain');
     const flight = flights.find((item) => item.id === flightId);
-    if (!flight || flight.locked) return;
+    if (!flight) return;
+    if (flight.locked) {
+      setOperationMessage(`${flight.flightNo} 已锁定机位，不能人工拖拽调整。`);
+      return;
+    }
     const rect = event.currentTarget.getBoundingClientRect();
     const duration = flight.departure - flight.arrival;
     const nextArrival = timelineStartMinutes + clamp(snapToTenMinutes(((event.clientX - rect.left) / rect.width) * timelineTotalMinutes), 0, timelineTotalMinutes - duration);
-    const nextFlights = flights.map((item) => (item.id === flightId ? { ...item, arrival: nextArrival, departure: nextArrival + duration, manualStandId: standId, baseStatus: '待确认' } : item));
-    const nextAssignments = assignments.map((assignment) => (assignment.flightId === flightId ? { ...assignment, standId, occupyStart: nextArrival, occupyEnd: nextArrival + duration, mode: 'single' } : assignment));
-    rerunPlan(nextFlights, nextAssignments, { mode: 'local', scopeIds: new Set([flightId]) });
+    const stand = standsData.find((item) => item.id === standId);
+    const currentAssignment = assignments.find((assignment) => assignment.flightId === flightId);
+    const manualAssignment = {
+      ...(currentAssignment || createAssignment(flight, stand)),
+      flightId,
+      standId,
+      occupyStart: nextArrival,
+      occupyEnd: nextArrival + duration,
+      mode: 'single',
+      source: 'manual-adjust',
+      status: 'assigned',
+      systemSnapshot: currentAssignment?.source === 'manual-adjust' ? currentAssignment.systemSnapshot : currentAssignment,
+    };
+    const reasons = explainManualMove(flight, stand, manualAssignment, assignments, flights);
+    const nextFlights = flights.map((item) => (item.id === flightId ? { ...item, arrival: nextArrival, departure: nextArrival + duration, baseStatus: '人工调整' } : item));
+    const nextAssignments = assignments.some((assignment) => assignment.flightId === flightId)
+      ? assignments.map((assignment) => (assignment.flightId === flightId ? manualAssignment : assignment))
+      : [...assignments, manualAssignment];
+    const nextTowTasks = generateTowTasks(nextFlights, nextAssignments, towTractors);
+    setFlights(nextFlights);
+    setAssignments(nextAssignments);
+    setTowTasks(nextTowTasks);
+    setOperationMessage(
+      reasons.length
+        ? `人工调整已应用，但存在不可行风险：${reasons.join('；')}。`
+        : `${flight.flightNo} 已人工调整至 ${standId}，冲突检测和指标已刷新。`,
+    );
     setDraggingFlightId(null);
     setActiveDropStand(null);
   }
@@ -930,6 +1047,8 @@ export default function App() {
           <div><span>冲突数量</span><strong>{metrics.conflicts}</strong></div>
           <div><span>硬冲突航班</span><strong>{metrics.unresolved}</strong></div>
           <div><span>拖曳任务</span><strong>{metrics.towTasks}</strong></div>
+          <div><span>远机位航班</span><strong>{metrics.remoteFlights}</strong></div>
+          <div><span>拖车利用率</span><strong>{metrics.towUtilization}%</strong></div>
           <div><span>近机位靠桥率</span><strong>{metrics.bridgeRate}%</strong></div>
           <div><span>平均周转</span><strong>{metrics.avgTurn}m</strong></div>
         </div>
@@ -938,7 +1057,7 @@ export default function App() {
         <button className="primary-button" type="button" onClick={() => setIsAddOpen(true)}>新增航班</button>
         <button type="button" onClick={handleAutoReassign}>自动重排</button>
         <button type="button" onClick={() => setIsResolveOpen(true)}>冲突消解</button>
-        <button type="button" onClick={() => setIsTowingOpen(true)}>拖车派遣</button>
+        <button type="button" onClick={handleOpenTowingDispatch}>拖车派遣</button>
         <div className="live-indicator"><span />优化闭环运行中</div>
       </section>
       {operationMessage && <div className="operation-message"><span>{operationMessage}</span><button type="button" onClick={() => setOperationMessage('')}>关闭</button></div>}
@@ -964,7 +1083,7 @@ export default function App() {
       </div>
       {isAddOpen && <FlightForm form={form} title="新增航班" eyebrow="Flight Input" submitText="加入优化队列" onChange={setForm} onClose={() => setIsAddOpen(false)} onSubmit={handleAddFlight} />}
       {editForm && <FlightForm form={editForm} title={`编辑航班 ${editForm.flightNo}`} eyebrow="Flight Edit" submitText="保存并重算" onChange={setEditForm} onClose={() => setEditForm(null)} onSubmit={handleEditFlight} />}
-      {selectedFlight && <FlightDetailModal assignment={selectedAssignment} flight={selectedFlight} stand={selectedFlightStand} towTask={selectedTowTask} onClose={() => setSelectedFlightId(null)} />}
+      {selectedFlight && <FlightDetailModal assignment={selectedAssignment} flight={selectedFlight} onRestoreSystem={handleRestoreSystemAssignment} stand={selectedFlightStand} towTask={selectedTowTask} onClose={() => setSelectedFlightId(null)} />}
       {selectedStandId && <StandDetailModal assignments={assignments} flights={displayFlights} issues={issues} stand={standsData.find((stand) => stand.id === selectedStandId)} towTasks={towTasks} onClose={() => setSelectedStandId(null)} />}
       {isResolveOpen && <ConflictResolveModal flights={displayFlights} issues={issues} onClose={() => setIsResolveOpen(false)} onResolve={handleResolveConflict} />}
       {isTowingOpen && <TowingDispatchModal flights={displayFlights} towTractors={towTractors} towTasks={towTasks} onAssignTow={handleAssignTow} onClose={() => setIsTowingOpen(false)} />}
